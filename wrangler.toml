@@ -4,4 +4,4 @@ compatibility_date = "2024-01-01"
 
 [vars]
 # 这里可以设默认值，但建议去 CF 后台设
-# MY_URL = "https://example.com"
+# url = "https://example.com"
