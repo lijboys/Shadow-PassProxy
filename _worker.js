@@ -1,12 +1,12 @@
 export default {
   async fetch(request, env) {
     try {
-      const targetStr = env.URL; // 推荐使用大写环境变量
+      const targetStr = env.URL;
       if (!targetStr) {
         return errorResponse(500, "请在 Worker 变量中设置 URL（目标站点）");
       }
 
-      // 智能解析目标（支持带路径的情况）
+      // 智能解析目标（支持带路径）
       const targetUrl = new URL(targetStr.startsWith('http') ? targetStr : `https://${targetStr}`);
       const targetDomain = targetUrl.hostname;
       const targetBasePath = targetUrl.pathname === '/' ? '' : targetUrl.pathname;
@@ -14,7 +14,6 @@ export default {
       const url = new URL(request.url);
       url.hostname = targetDomain;
       url.protocol = 'https:';
-      // 如果目标有子路径，自动拼接（保持兼容）
       if (targetBasePath && !url.pathname.startsWith(targetBasePath)) {
         url.pathname = targetBasePath + url.pathname;
       }
@@ -24,8 +23,7 @@ export default {
       newHeaders.set('Host', targetDomain);
       newHeaders.set('Origin', `https://${targetDomain}`);
       newHeaders.set('Referer', `https://${targetDomain}${url.pathname}${url.search}`);
-      
-      // 传递真实 IP（很多网站依赖此防作弊）
+
       if (request.headers.get('cf-connecting-ip')) {
         newHeaders.set('X-Forwarded-For', request.headers.get('cf-connecting-ip'));
       }
@@ -46,12 +44,11 @@ export default {
       const responseHeaders = new Headers(response.headers);
 
       // ==================== 响应头处理 ====================
-      // 跨域
       responseHeaders.set('Access-Control-Allow-Origin', '*');
       responseHeaders.set('Access-Control-Allow-Methods', 'GET, POST, PUT, DELETE, OPTIONS');
       responseHeaders.set('Access-Control-Allow-Headers', '*');
 
-      // 安全头清理
+      // 清理安全头
       ['content-security-policy', 'x-frame-options', 'clear-site-data', 'x-content-security-policy'].forEach(h => {
         responseHeaders.delete(h);
       });
@@ -62,26 +59,34 @@ export default {
       // 重写 Set-Cookie（支持多个）
       rewriteSetCookie(responseHeaders, targetDomain, request.url);
 
-      // ==================== 内容重写（核心升级）===================
+      // ==================== 内容重写（已修复）===================
       let body = response.body;
       const contentType = responseHeaders.get('content-type') || '';
 
       if (contentType.includes('text/html')) {
-        // 使用 HTMLRewriter 流式重写所有绝对 URL
-        body = new HTMLRewriter()
+        const transformed = new HTMLRewriter()
           .on('a[href], link[href], script[src], img[src], source[src], iframe[src], form[action]', {
             element(element) {
-              const attr = element.getAttribute('href') || element.getAttribute('src') || element.getAttribute('action');
-              if (!attr) return;
-              if (attr.startsWith('http') || attr.startsWith('//')) {
-                const newUrl = attr.replace(new RegExp(`(https?:)?//${targetDomain}`, 'gi'), new URL(request.url).origin);
+              const attrs = ['href', 'src', 'action'];
+              for (const attrName of attrs) {
+                let attr = element.getAttribute(attrName);
+                if (!attr) continue;
+
+                // 只重写 http/https 和 // 开头的绝对链接
                 if (attr.startsWith('http') || attr.startsWith('//')) {
-                  element.setAttribute(element.getAttribute('href') ? 'href' : 'src', newUrl);
+                  const newUrl = attr.replace(
+                    new RegExp(`(https?:)?//${targetDomain}`, 'gi'),
+                    new URL(request.url).origin
+                  );
+                  element.setAttribute(attrName, newUrl);
+                  break; // 一个元素只处理一个属性
                 }
               }
             }
           })
-          .transform(response.body);
+          .transform(response);   // ← 关键修复：传入 response 而不是 response.body
+
+        body = transformed.body;
       }
 
       return new Response(body, {
@@ -111,7 +116,6 @@ function rewriteSetCookie(headers, oldDomain, requestUrl) {
   const origin = new URL(requestUrl).origin;
   for (const cookie of cookies) {
     let newCookie = cookie.replace(new RegExp(`(domain=)?${oldDomain}`, 'gi'), `domain=${origin.replace('https://', '')}`);
-    // 同时清除 Secure 和 SameSite 限制（防止 Cookie 无法设置）
     newCookie = newCookie.replace(/;\s*secure/gi, '').replace(/;\s*samesite=[^;]*/gi, '');
     headers.append('set-cookie', newCookie);
   }
