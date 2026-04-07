@@ -1,77 +1,128 @@
 export default {
   async fetch(request, env) {
     try {
-      // 1. 读取你在 CF 后台设置的变量 url
-      const targetStr = env.url; 
-      
+      const targetStr = env.URL; // 推荐使用大写环境变量
       if (!targetStr) {
-        return new Response("还没设置跳转目标哦！请在 Worker 设置 -> 变量中添加名为 url 的变量。", { 
-          status: 500,
-          headers: { 'Content-Type': 'text/plain; charset=utf-8' }
-        });
+        return errorResponse(500, "请在 Worker 变量中设置 URL（目标站点）");
       }
 
-      // 智能处理你填写的变量：不管你填的是 https://abc.com 还是 abc.com/xxx，都只提取纯域名
-      const targetDomain = targetStr.replace(/^https?:\/\//, '').split('/')[0];
+      // 智能解析目标（支持带路径的情况）
+      const targetUrl = new URL(targetStr.startsWith('http') ? targetStr : `https://${targetStr}`);
+      const targetDomain = targetUrl.hostname;
+      const targetBasePath = targetUrl.pathname === '/' ? '' : targetUrl.pathname;
 
       const url = new URL(request.url);
       url.hostname = targetDomain;
-      url.protocol = 'https:'; // 强制用 HTTPS 去拉取目标网站
+      url.protocol = 'https:';
+      // 如果目标有子路径，自动拼接（保持兼容）
+      if (targetBasePath && !url.pathname.startsWith(targetBasePath)) {
+        url.pathname = targetBasePath + url.pathname;
+      }
 
-      // 2. 构造新的请求头，深度伪装
+      // ==================== 请求头深度伪装 ====================
       const newHeaders = new Headers(request.headers);
       newHeaders.set('Host', targetDomain);
       newHeaders.set('Origin', `https://${targetDomain}`);
-      newHeaders.set('Referer', `https://${targetDomain}${url.pathname}`);
+      newHeaders.set('Referer', `https://${targetDomain}${url.pathname}${url.search}`);
       
-      // 3. 构造 Fetch 参数
+      // 传递真实 IP（很多网站依赖此防作弊）
+      if (request.headers.get('cf-connecting-ip')) {
+        newHeaders.set('X-Forwarded-For', request.headers.get('cf-connecting-ip'));
+      }
+
+      // WebSocket 直通
+      if (newHeaders.get('Upgrade')?.toLowerCase() === 'websocket') {
+        return fetch(url.toString(), { headers: newHeaders, redirect: 'manual' });
+      }
+
       const init = {
         method: request.method,
         headers: newHeaders,
-        redirect: 'manual' // 核心：拦截重定向，防止跳回原域名
+        redirect: 'manual',
+        body: !['GET', 'HEAD'].includes(request.method) ? request.body : null,
       };
-      
-      // 核心修复：GET 和 HEAD 请求坚决不能带 body，否则会报错
-      if (request.method !== 'GET' && request.method !== 'HEAD') {
-        init.body = request.body;
-      }
 
-      // 4. 发起反代请求
       const response = await fetch(url.toString(), init);
-
-      // 5. 处理返回的响应头
       const responseHeaders = new Headers(response.headers);
-      
-      // 解决跨域问题
+
+      // ==================== 响应头处理 ====================
+      // 跨域
       responseHeaders.set('Access-Control-Allow-Origin', '*');
-      
-      // 核心：如果有重定向，把目标网站的域名替换回你自己的 Worker 域名，防止露馅
-      const location = responseHeaders.get('Location');
-      if (location) {
-        responseHeaders.set(
-          'Location', 
-          location.replace(new RegExp(`https?://${targetDomain}`, 'ig'), new URL(request.url).origin)
-        );
+      responseHeaders.set('Access-Control-Allow-Methods', 'GET, POST, PUT, DELETE, OPTIONS');
+      responseHeaders.set('Access-Control-Allow-Headers', '*');
+
+      // 安全头清理
+      ['content-security-policy', 'x-frame-options', 'clear-site-data', 'x-content-security-policy'].forEach(h => {
+        responseHeaders.delete(h);
+      });
+
+      // 重写 Location
+      rewriteLocation(responseHeaders, targetDomain, new URL(request.url).origin);
+
+      // 重写 Set-Cookie（支持多个）
+      rewriteSetCookie(responseHeaders, targetDomain, request.url);
+
+      // ==================== 内容重写（核心升级）===================
+      let body = response.body;
+      const contentType = responseHeaders.get('content-type') || '';
+
+      if (contentType.includes('text/html')) {
+        // 使用 HTMLRewriter 流式重写所有绝对 URL
+        body = new HTMLRewriter()
+          .on('a[href], link[href], script[src], img[src], source[src], iframe[src], form[action]', {
+            element(element) {
+              const attr = element.getAttribute('href') || element.getAttribute('src') || element.getAttribute('action');
+              if (!attr) return;
+              if (attr.startsWith('http') || attr.startsWith('//')) {
+                const newUrl = attr.replace(new RegExp(`(https?:)?//${targetDomain}`, 'gi'), new URL(request.url).origin);
+                if (attr.startsWith('http') || attr.startsWith('//')) {
+                  element.setAttribute(element.getAttribute('href') ? 'href' : 'src', newUrl);
+                }
+              }
+            }
+          })
+          .transform(response.body);
       }
 
-      // 抹除目标网站防反代、防嵌套的安全头，避免浏览器白屏
-      responseHeaders.delete('Content-Security-Policy');
-      responseHeaders.delete('X-Frame-Options');
-      responseHeaders.delete('Clear-Site-Data');
-
-      // 返回最终内容给浏览器
-      return new Response(response.body, {
+      return new Response(body, {
         status: response.status,
         statusText: response.statusText,
-        headers: responseHeaders
+        headers: responseHeaders,
       });
 
     } catch (err) {
-      // 如果出错，直接把报错信息打出来，方便排查，而不是显示死板的 CF 错误页
-      return new Response(`反代执行出错啦: \n${err.message}`, { 
-        status: 500,
-        headers: { 'Content-Type': 'text/plain; charset=utf-8' }
-      });
+      return errorResponse(500, `反代出错: ${err.message}\n${err.stack}`);
     }
   }
 };
+
+// ====================== 辅助函数 ======================
+function rewriteLocation(headers, oldDomain, newOrigin) {
+  const location = headers.get('location');
+  if (location) {
+    headers.set('location', location.replace(new RegExp(`(https?:)?//${oldDomain}`, 'gi'), newOrigin));
+  }
+}
+
+function rewriteSetCookie(headers, oldDomain, requestUrl) {
+  const cookies = headers.getAll ? headers.getAll('set-cookie') : [headers.get('set-cookie')].filter(Boolean);
+  headers.delete('set-cookie');
+
+  const origin = new URL(requestUrl).origin;
+  for (const cookie of cookies) {
+    let newCookie = cookie.replace(new RegExp(`(domain=)?${oldDomain}`, 'gi'), `domain=${origin.replace('https://', '')}`);
+    // 同时清除 Secure 和 SameSite 限制（防止 Cookie 无法设置）
+    newCookie = newCookie.replace(/;\s*secure/gi, '').replace(/;\s*samesite=[^;]*/gi, '');
+    headers.append('set-cookie', newCookie);
+  }
+}
+
+function errorResponse(status, message) {
+  return new Response(message, {
+    status,
+    headers: {
+      'Content-Type': 'text/plain; charset=utf-8',
+      'X-Proxy-Error': 'true'
+    }
+  });
+}
